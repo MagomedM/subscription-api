@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  # PostgreSQL база данных
+  postgres:
+    image: postgres:15-alpine
+    container_name: subscription_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: subscriptiondb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - subscription_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Go приложение
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: subscription_app
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/subscriptiondb?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - subscription_network
+    volumes:
+      # Для разработки: монтируем код для горячей перезагрузки (опционально)
+      - ./:/app
+
+  # Adminer - веб-интерфейс для управления БД (опционально)
+  adminer:
+    image: adminer:latest
+    container_name: subscription_adminer
+    ports:
+      - "8081:8080"
+    depends_on:
+      - postgres
+    networks:
+      - subscription_network
+
+volumes:
+  postgres_data:
+
+networks:
+  subscription_network:
+    driver: bridge
