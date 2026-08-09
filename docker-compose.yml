@@ -7,7 +7,7 @@ services:
     container_name: subscription_postgres
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: subscriptiondb
     ports:
       - "5432:5432"

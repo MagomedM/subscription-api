@@ -3,14 +3,13 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"github.com/jackc/pgx/v5"
-	"github.com/joho/godotenv"
 	"io"
 	"log"
 	"net/http"
-	"os"
-	"projects_for_goland/db"
+	"projects_for_goland/internal/models"
+	"projects_for_goland/internal/service"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,7 +29,6 @@ func Init() {
 // @Router       /api/subscription [post]
 // @Router       /api/subscription [put]
 // @Router       /api/subscription [delete]
-
 func subHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -55,31 +53,29 @@ func subHandler(w http.ResponseWriter, r *http.Request) {
 // @Accept       json
 // @Produce      json
 // @Param        user_id   query     string  true  "ID пользователя"  example(123)
-// @Success      200  {object}  db.SubUser  "Успешный ответ"
+// @Success      200  {object}  models.SubUser  "Успешный ответ"
 // @Failure      400  {string}  string  "ID не указан"
 // @Failure      404  {string}  string  "Подписка не найдена"
 // @Failure      500  {string}  string  "Ошибка сервера"
 // @Router       /api/subscription_id [get]
 func getidHandler(w http.ResponseWriter, r *http.Request) {
-	if err := godotenv.Load(); err != nil {
-		log.Println("env файл не найден")
-	}
-	dba, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatalf("Невозможно подключиться к базе данных: %v", err)
-	}
-	defer dba.Close(context.Background())
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 	id := r.URL.Query().Get("user_id")
 	if id == "" {
 		log.Fatalf("Id не указан")
 	}
-	row := dba.QueryRow(context.Background(), "SELECT service_name, price, user_id, start_date, end_date FROM users WHERE user_id = $1", id)
-	var u db.SubUser
-	err = row.Scan(&u.ServiceName, &u.Price, &u.UserID, &u.StartDate, &u.EndDate)
+	sub, err := service.GetSubId(ctx, id)
 	if err != nil {
-		log.Fatalf("Ошибка получения записи по id: %v", err)
+		if strings.Contains(err.Error(), "не найдена") {
+			http.Error(w, "Подписка не найдена", http.StatusNotFound)
+		} else {
+			http.Error(w, "Ошибка сервера", http.StatusInternalServerError)
+			log.Printf("Ошибка получения подписки: %v", err)
+		}
+		return
 	}
-	writeJson(w, &u)
+	writeJson(w, sub)
 	log.Println("Получение записи по id успешно")
 }
 
@@ -98,62 +94,19 @@ func getidHandler(w http.ResponseWriter, r *http.Request) {
 // @Failure      500  {object}  map[string]string  "Внутренняя ошибка сервера"
 // @Router       /api/subscription_summary [get]
 func getSumHandler(w http.ResponseWriter, r *http.Request) {
-	if err := godotenv.Load(); err != nil {
-		log.Println("env файл не найден")
-	}
-	dba, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatalf("Невозможно подключиться к базе данных: %v", err)
-	}
-	defer dba.Close(context.Background())
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
 	startstr := r.URL.Query().Get("start_date")
 	endstr := r.URL.Query().Get("end_date")
 	userID := r.URL.Query().Get("user_id")
 	serviceName := r.URL.Query().Get("service_name")
 
-	const layout = "01-2006"
-	stardate, err := time.Parse(layout, startstr)
+	subsum, err := service.GetSum(ctx, startstr, endstr, userID, serviceName)
 	if err != nil {
-		log.Fatalf("Ошибка парсинга начальной даты: %v", err)
+		log.Fatalf("ошибка получения суммы подписок:%v", err)
 	}
-	enddate, err := time.Parse(layout, endstr)
-	if err != nil {
-		log.Fatalf("Ошибка парсинга конечной даты: %v", err)
-	}
-	query := `
-		SELECT COALESCE(SUM(price), 0)
-		FROM users
-		WHERE TO_DATE(start_date, 'MM-YYYY') >= $1::DATE AND TO_DATE(end_date, 'MM-YYYY') <= $2::DATE
-	`
-
-	argIdx := 3
-	args := []interface{}{stardate, enddate}
-
-	if userID != "" {
-		query += ` AND user_id = $` + strconv.Itoa(argIdx)
-		args = append(args, userID)
-		argIdx++
-	}
-
-	if serviceName != "" {
-		query += ` AND service_name ILIKE $` + strconv.Itoa(argIdx)
-		args = append(args, "%"+serviceName+"%") // поиск по частичному совпадению
-		argIdx++
-	}
-
-	var sumtotal int64
-	err = dba.QueryRow(context.Background(), query, args...).Scan(&sumtotal)
-	if err != nil {
-		log.Fatalf("Ошибка подсчёта суммы: %v", err)
-	}
-	response := map[string]interface{}{
-		"start_date":   startstr,
-		"end_date":     endstr,
-		"user_id":      userID,
-		"service_name": serviceName,
-		"total_sum":    sumtotal,
-	}
-	writeJson(w, response)
+	writeJson(w, subsum)
 	log.Println("Получение суммы всех подписок за выбранный период успешно")
 }
 
@@ -163,31 +116,22 @@ func getSumHandler(w http.ResponseWriter, r *http.Request) {
 // @Tags         subscriptions
 // @Accept       json
 // @Produce      json
-// @Success      200  {object}  db.SubsFull  "Список всех подписок"
+// @Success      200  {object}  models.SubsFull  "Список всех подписок"
 // @Failure      500  {string}  string  "Ошибка сервера"
 // @Router       /api/subscription [get]
 func getSubHandler(w http.ResponseWriter, r *http.Request) {
-	if err := godotenv.Load(); err != nil {
-		log.Println("env файл не найден")
-	}
-	dba, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+
+	subs, err := service.GetSubs(ctx, page, limit)
 	if err != nil {
-		log.Fatalf("Невозможно подключиться к базе данных: %v", err)
+		log.Fatalf("Ошибка получения подписок: %v", err)
 	}
-	defer dba.Close(context.Background())
-	row, err := dba.Query(context.Background(), "SELECT * FROM users")
-	var subs []*db.SubUser
-	for row.Next() {
-		var u db.SubUser
-		err = row.Scan(&u.ServiceName, &u.Price, &u.UserID, &u.StartDate, &u.EndDate)
-		if err != nil {
-			log.Fatalf("Ошибка получения записей: %v", err)
-		}
-		subs = append(subs, &u)
-	}
-	writeJson(w, db.SubsFull{
-		Subs: subs,
-	})
+	writeJson(w, subs)
+	log.Printf("Получены записи (страница %d, лимит %d)", page, limit)
 }
 
 // postSubHandler создаёт новую подписку
@@ -196,52 +140,33 @@ func getSubHandler(w http.ResponseWriter, r *http.Request) {
 // @Tags         subscriptions
 // @Accept       json
 // @Produce      json
-// @Param        subscription  body      db.SubUser  true  "Данные новой подписки"
+// @Param        subscription  body      models.SubUser  true  "Данные новой подписки"
 // @Success      200  {object}  map[string]interface{}  "ID созданной подписки"
 // @Failure      400  {string}  string  "Пустое тело запроса"
 // @Failure      500  {string}  string  "Ошибка сервера"
 // @Router       /api/subscription [post]
 func postSubHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var sub models.SubUser
 	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		log.Fatalf("Ошибка чтения тела запроса: %v", err)
-	}
-	defer r.Body.Close()
-	if len(body) == 0 {
-		log.Fatalf("Пустое тело запроса")
-	}
-	if err := godotenv.Load(); err != nil {
-		log.Println("env файл не найден")
-	}
-	dba, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatalf("Невозможно подключиться к базе данных: %v", err)
-	}
-	defer dba.Close(context.Background())
-	var userID string
-	var u db.SubUser
-	err = json.Unmarshal(body, &u)
-	if err != nil {
+	if err := json.Unmarshal(body, &sub); err != nil {
 		log.Fatalf("Ошибка десериализации: %v", err)
 	}
-	err = dba.QueryRow(context.Background(), `
-		INSERT INTO users(service_name, price, start_date, end_date)
-		VALUES($1, $2, $3, $4)
-		RETURNING user_id
-	`,
-		u.ServiceName,
-		u.Price,
-		u.StartDate,
-		u.EndDate,
-	).Scan(&userID)
+
+	defer r.Body.Close()
+	userID, err := service.PostSub(ctx, &sub)
 	if err != nil {
-		log.Printf("Ошибка создания записи: %v", err)
+		log.Fatalf("Ошибка создания записи: %v", err)
 	}
 	log.Println(userID)
 	response := map[string]interface{}{
 		"user_id": userID,
 	}
+	w.WriteHeader(http.StatusCreated)
 	writeJson(w, response)
+	log.Printf("Создана новая запись по id: %s", userID)
 }
 
 // putSubHandler обновляет существующую подписку
@@ -250,12 +175,15 @@ func postSubHandler(w http.ResponseWriter, r *http.Request) {
 // @Tags         subscriptions
 // @Accept       json
 // @Produce      json
-// @Param        subscription  body      db.SubUser  true  "Обновлённые данные подписки"
-// @Success      200  {object}  db.SubUser  "Обновлённая подписка"
+// @Param        subscription  body      models.SubUser  true  "Обновлённые данные подписки"
+// @Success      200  {object}  models.SubUser  "Обновлённая подписка"
 // @Failure      400  {string}  string  "Пустое тело запроса"
 // @Failure      500  {string}  string  "Ошибка сервера"
 // @Router       /api/subscription [put]
 func putSubHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Fatalf("Ошибка чтения тела запроса: %v", err)
@@ -264,27 +192,15 @@ func putSubHandler(w http.ResponseWriter, r *http.Request) {
 	if len(body) == 0 {
 		log.Fatalf("Пустое тело запроса")
 	}
-	if err := godotenv.Load(); err != nil {
-		log.Println("env файл не найден")
-	}
-	dba, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatalf("Невозможно подключиться к базе данных: %v", err)
-	}
-	defer dba.Close(context.Background())
-	var u db.SubUser
-	err = json.Unmarshal(body, &u)
+
+	var sub models.SubUser
+	err = json.Unmarshal(body, &sub)
 	if err != nil {
 		log.Fatalf("Ошибка десериализации")
 	}
-	_, err = dba.Exec(context.Background(), `UPDATE users
-    SET service_name = $1, price = $2, start_date = $3, end_date = $4 
-    WHERE user_id = $5 
-    RETURNING *`, u.ServiceName, u.Price, u.StartDate, u.EndDate, u.UserID)
-	if err != nil {
-		log.Fatalf("Ошибка обновления записи: %v", err)
-	}
-	writeJson(w, u)
+	err = service.PutSub(ctx, &sub)
+	writeJson(w, sub)
+	log.Printf("Обновлена запись по id: %s", sub.UserID)
 }
 
 // deleteSubHandler удаляет подписку
@@ -299,24 +215,18 @@ func putSubHandler(w http.ResponseWriter, r *http.Request) {
 // @Failure      500  {string}  string  "Ошибка сервера"
 // @Router       /api/subscription [delete]
 func deleteSubHandler(w http.ResponseWriter, r *http.Request) {
-	if err := godotenv.Load(); err != nil {
-		log.Println("env файл не найден")
-	}
-	dba, err := pgx.Connect(context.Background(), os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatalf("Невозможно подключиться к базе данных: %v", err)
-	}
-	defer dba.Close(context.Background())
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
 	id := r.URL.Query().Get("user_id")
-	if id == "" {
-		log.Fatalf("Id не указан")
-	}
-	_, err = dba.Exec(context.Background(), `DELETE FROM users WHERE user_id = $1`, id)
+	err := service.DelSub(ctx, id)
 	if err != nil {
 		log.Fatalf("Ошибка удаления записи: %v", err)
 	}
 	writeJson(w, nil)
+	log.Printf("Удалена запись по id: %s", id)
 }
+
 func writeJson(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
 	jsonData, err := json.Marshal(data)

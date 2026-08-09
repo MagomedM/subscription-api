@@ -4,9 +4,9 @@ import (
 	httpSwagger "github.com/swaggo/http-swagger"
 	"log"
 	"net/http"
-	"projects_for_goland/api"
 	"projects_for_goland/db"
 	_ "projects_for_goland/docs"
+	"projects_for_goland/internal/api"
 	"projects_for_goland/server"
 )
 
